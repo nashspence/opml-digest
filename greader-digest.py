@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-import json
-import logging
 import os
 import sys
-import textwrap
+import json
+import logging
 from datetime import datetime, timezone
-from typing import Any
 
 import requests
 import trafilatura
+import yaml
 from openai import OpenAI
 
 
@@ -31,9 +30,11 @@ def env(name, default=None, required=False):
 
 
 def strip_html(html_text: str) -> str:
-    import html as html_mod
     import re
+    import html as html_mod
 
+    if not html_text:
+        return ""
     text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html_text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html_mod.unescape(text)
@@ -41,9 +42,74 @@ def strip_html(html_text: str) -> str:
     return text.strip()
 
 
-def authenticate_greader(
-    base_url: str, username: str, api_password: str, timeout: int = 20
-) -> str:
+def clean_lines_generic(text: str) -> str:
+    """Drop obvious menu/boilerplate lines: tiny, punctuation-only, etc."""
+    if not text:
+        return ""
+    lines = [l.rstrip() for l in text.splitlines()]
+    cleaned = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        # Short lines are usually navigation labels etc.
+        if len(s) <= 3:
+            continue
+        # Lines that are mostly punctuation / bullets
+        if all(c in "-•|·.,:;_/\\[]" for c in s):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def looks_useful(text: str) -> bool:
+    """Heuristic to decide whether content is worth sending to the model."""
+    if not text:
+        return False
+    # Minimum length: be strict; we prefer missing stuff to junk
+    if len(text) < 300:
+        return False
+    # Require at least a few sentence boundaries
+    sentence_like = text.count(".") + text.count("!") + text.count("?")
+    if sentence_like < 3:
+        return False
+    return True
+
+
+def load_yaml_config(path: str | None) -> tuple[dict, dict]:
+    if not path:
+        logging.info("No FEED_CONFIG_PATH provided; using empty YAML config")
+        return {}, {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        logging.warning("YAML config file not found at %s; proceeding with defaults", path)
+        return {}, {}
+    except Exception as exc:
+        logging.warning("Failed to load YAML config from %s: %s", path, exc)
+        return {}, {}
+
+    if not isinstance(data, dict):
+        logging.warning("YAML config root is not a mapping; ignoring")
+        return {}, {}
+
+    global_cfg = data.get("global") or {}
+    feeds_cfg = data.get("feeds") or {}
+    if not isinstance(global_cfg, dict):
+        global_cfg = {}
+    if not isinstance(feeds_cfg, dict):
+        feeds_cfg = {}
+
+    logging.info(
+        "Loaded YAML config: %d feed entries, global keys: %s",
+        len(feeds_cfg),
+        ", ".join(global_cfg.keys()) or "(none)",
+    )
+    return global_cfg, feeds_cfg
+
+
+def authenticate_greader(base_url: str, username: str, api_password: str, timeout: int = 20) -> str:
     url = base_url.rstrip("/") + "/accounts/ClientLogin"
     logging.info("Authenticating to FreshRSS Google Reader API as %s", username)
     resp = requests.post(
@@ -66,11 +132,9 @@ def authenticate_greader(
     return auth_token
 
 
-def fetch_subscriptions(
-    base_url: str, auth_token: str, timeout: int = 20
-) -> dict[str, dict[str, Any]]:
+def fetch_subscriptions(base_url: str, auth_token: str, timeout: int = 20) -> dict:
     url = base_url.rstrip("/") + "/reader/api/0/subscription/list"
-    params: dict[str, str] = {"output": "json"}
+    params = {"output": "json"}
     headers = {"Authorization": "GoogleLogin auth=" + auth_token}
     logging.info("Fetching subscriptions")
     resp = requests.get(url, headers=headers, params=params, timeout=timeout)
@@ -80,21 +144,17 @@ def fetch_subscriptions(
     data = resp.json()
     subs = data.get("subscriptions", [])
     logging.info("Fetched %d subscriptions", len(subs))
-    sub_map: dict[str, dict[str, Any]] = {}
+    sub_map = {}
     for s in subs:
-        if not isinstance(s, dict):
-            continue
         sid = s.get("id")
-        if isinstance(sid, str):
+        if sid:
             sub_map[sid] = s
     return sub_map
 
 
-def fetch_unread_items(
-    base_url: str, auth_token: str, max_items: int, timeout: int = 30
-) -> list[dict[str, Any]]:
+def fetch_unread_items(base_url: str, auth_token: str, max_items: int, timeout: int = 30) -> list:
     url = base_url.rstrip("/") + "/reader/api/0/stream/contents/reading-list"
-    params: dict[str, str | int] = {
+    params = {
         "n": max_items,
         "xt": "user/-/state/com.google/read",
         "output": "json",
@@ -108,86 +168,65 @@ def fetch_unread_items(
     data = resp.json()
     items = data.get("items", [])
     logging.info("Fetched %d unread items", len(items))
-    return [i for i in items if isinstance(i, dict)]
-
-
-def fetch_feed_descriptions(
-    base_url: str, auth_token: str, stream_ids: set[str], timeout: int = 20
-) -> dict[str, str]:
-    headers = {"Authorization": "GoogleLogin auth=" + auth_token}
-    feed_descriptions: dict[str, str] = {}
-    if not stream_ids:
-        return feed_descriptions
-    logging.info("Fetching feed descriptions for %d feeds", len(stream_ids))
-    for sid in stream_ids:
-        url = base_url.rstrip("/") + "/reader/api/0/stream/contents/" + sid
-        params: dict[str, str | int] = {"n": 0, "output": "json"}
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
-        except Exception as exc:
-            logging.warning("Error fetching description for %s: %s", sid, exc)
-            continue
-        if resp.status_code != 200:
-            logging.warning(
-                "Failed to fetch feed metadata for %s, HTTP %s", sid, resp.status_code
-            )
-            continue
-        try:
-            data = resp.json()
-        except Exception as exc:
-            logging.warning("Invalid JSON for feed %s: %s", sid, exc)
-            continue
-        desc = data.get("description")
-        if isinstance(desc, str) and desc.strip():
-            feed_descriptions[sid] = desc.strip()
-    logging.info("Resolved descriptions for %d feeds", len(feed_descriptions))
-    return feed_descriptions
+    return items
 
 
 def extract_main_text(url: str) -> str | None:
+    """Use trafilatura as aggressively as possible, biasing toward precision."""
     if not url:
         return None
     try:
         downloaded = trafilatura.fetch_url(url)
     except Exception as exc:
         logging.debug("trafilatura fetch_url failed for %s: %s", url, exc)
-        return None
-    if not downloaded:
-        return None
-    try:
-        text = trafilatura.extract(downloaded, include_comments=False)
-    except Exception as exc:
-        logging.debug("trafilatura extract failed for %s: %s", url, exc)
-        return None
+        downloaded = None
+
+    text = None
+    if downloaded:
+        try:
+            text = trafilatura.extract(
+                downloaded,
+                include_comments=False,
+                include_formatting=False,
+                include_links=False,
+                favor_precision=True,
+            )
+        except Exception as exc:
+            logging.debug("trafilatura extract(content) failed for %s: %s", url, exc)
+
+    if not text:
+        try:
+            text = trafilatura.extract(
+                url=url,
+                include_comments=False,
+                include_formatting=False,
+                include_links=False,
+                favor_precision=True,
+            )
+        except Exception as exc:
+            logging.debug("trafilatura extract(url=...) failed for %s: %s", url, exc)
+
     if text:
-        return text.strip()
+        cleaned = text.strip()
+        if cleaned:
+            return cleaned
     return None
 
 
 def normalize_item(
     item: dict,
     subscriptions: dict,
-    feed_descriptions: dict,
     fetch_full_content: bool,
     article_max_chars: int,
 ) -> dict:
     origin = item.get("origin") or {}
     stream_id = origin.get("streamId")
     subscription = subscriptions.get(stream_id, {}) if stream_id else {}
-    categories = subscription.get("categories") or []
-    category_labels = [
-        c.get("label") for c in categories if isinstance(c, dict) and c.get("label")
-    ]
-    feed_title = origin.get("title") or subscription.get("title") or ""
-    feed_html_url = (
-        origin.get("htmlUrl")
-        or subscription.get("htmlUrl")
-        or subscription.get("url")
-        or ""
-    )
-    feed_description = (
-        feed_descriptions.get(stream_id) or subscription.get("description") or ""
-    )
+
+    # Feed URL: prefer subscription["url"] (canonical RSS/Atom URL)
+    feed_url = subscription.get("url") or ""
+
+    # Basic article fields
     summary_html = ""
     summary_obj = item.get("summary") or {}
     if isinstance(summary_obj, dict):
@@ -196,11 +235,13 @@ def normalize_item(
         content_obj = item.get("content") or {}
         if isinstance(content_obj, dict):
             summary_html = content_obj.get("content") or ""
+
     alternate = item.get("alternate") or []
     url = ""
     if alternate and isinstance(alternate, list):
         first_alt = alternate[0] or {}
         url = first_alt.get("href") or ""
+
     published_ts = item.get("published") or 0
     try:
         published_iso = datetime.fromtimestamp(
@@ -208,98 +249,205 @@ def normalize_item(
         ).isoformat()
     except Exception:
         published_iso = ""
+
     content_text = ""
+
+    # 1) Prefer full-page extraction
     if fetch_full_content and url:
         content_text = extract_main_text(url) or ""
+
+    # 2) Fallback: cleaned feed HTML, but only if non-trivial
     if not content_text:
-        content_text = strip_html(summary_html) if summary_html else ""
+        raw = strip_html(summary_html)
+        if len(raw) >= 200:  # be strict: prefer missing over junk
+            content_text = raw
+        else:
+            content_text = ""
+
+    # 3) Generic boilerplate cleaning
+    content_text = clean_lines_generic(content_text)
+
+    # 4) Hard length cap
     if content_text and article_max_chars > 0 and len(content_text) > article_max_chars:
         content_text = content_text[:article_max_chars]
+
     return {
-        "id": item.get("id") or "",
+        "item_id": item.get("id") or "",
+        "feed_url": feed_url,
         "title": item.get("title") or "",
-        "url": url,
         "published": published_iso,
         "content": content_text,
-        "feed_stream_id": stream_id or "",
-        "feed_title": feed_title,
-        "feed_html_url": feed_html_url,
-        "feed_description": feed_description,
-        "feed_categories": category_labels,
     }
 
 
-def build_summarization_payload(
-    username: str,
-    summary_goal: str,
+def apply_feed_stripping(content_text: str, feed_cfg: dict) -> str:
+    """Feed-specific stripping rules from YAML (strip_contains)."""
+    if not content_text:
+        return ""
+    strip_contains = feed_cfg.get("strip_contains") or []
+    if not strip_contains:
+        return content_text
+
+    lowered_patterns = [p.lower() for p in strip_contains if isinstance(p, str) and p]
+    if not lowered_patterns:
+        return content_text
+
+    lines = content_text.splitlines()
+    kept_lines = []
+    for raw_line in lines:
+        l = raw_line.lower()
+        if any(p in l for p in lowered_patterns):
+            continue
+        kept_lines.append(raw_line)
+    return "\n".join(kept_lines)
+
+
+def build_summarization_payload_and_item_ids(
     items: list,
     subscriptions: dict,
-    feed_descriptions: dict,
+    feeds_cfg: dict,
+    summary_goal: str,
     fetch_full_content: bool,
     article_max_chars: int,
-) -> str:
-    normalized = [
-        normalize_item(
-            i, subscriptions, feed_descriptions, fetch_full_content, article_max_chars
-        )
-        for i in items
-    ]
-    normalized = [n for n in normalized if n["title"] or n["content"]]
-    normalized.sort(key=lambda n: n.get("published") or "", reverse=True)
-    feed_context: dict[str, dict] = {}
-    for n in normalized:
-        sid = n["feed_stream_id"]
-        if not sid:
+) -> tuple[str, list[str]]:
+    feeds_by_url: dict[str, dict] = {}
+
+    for item in items:
+        norm = normalize_item(item, subscriptions, fetch_full_content, article_max_chars)
+        item_id = norm.get("item_id") or ""
+        feed_url = norm.get("feed_url") or ""
+        title = norm.get("title") or ""
+        content = norm.get("content") or ""
+
+        if not feed_url:
+            logging.debug("Skipping item without feed_url (id=%s)", item_id)
             continue
-        if sid not in feed_context:
-            feed_context[sid] = {
-                "id": sid,
-                "title": n["feed_title"],
-                "html_url": n["feed_html_url"],
-                "description": n["feed_description"],
-                "categories": n["feed_categories"],
+
+        feed_cfg = feeds_cfg.get(feed_url, {}) if isinstance(feeds_cfg, dict) else {}
+
+        # Feed-specific stripping
+        content = apply_feed_stripping(content, feed_cfg)
+        content = clean_lines_generic(content)  # one more pass after strip
+
+        # Strict usefulness check
+        if not looks_useful(content):
+            logging.debug("Skipping low-value content for feed=%s id=%s", feed_url, item_id)
+            continue
+
+        if not (title or content):
+            logging.debug("Skipping item without title/content (id=%s)", item_id)
+            continue
+
+        priority = int(feed_cfg.get("priority", 0) or 0)
+        description = str(feed_cfg.get("description", "") or "")
+        representation = str(feed_cfg.get("representation", "") or "")
+
+        feed_data = feeds_by_url.get(feed_url)
+        if not feed_data:
+            feed_data = {
+                "priority": priority,
+                "description": description,
+                "representation": representation,
+                "articles": [],
+                "item_ids": [],
             }
+            feeds_by_url[feed_url] = feed_data
+
+        feed_data["articles"].append(
+            {
+                "title": title,
+                "content": content,
+                "published": norm.get("published") or "",
+            }
+        )
+        if item_id:
+            feed_data["item_ids"].append(item_id)
+
+    if not feeds_by_url:
+        logging.info("No items with usable content for summarization after filtering")
+        payload = {
+            "summary_goal": summary_goal,
+            "feeds": [],
+        }
+        return json.dumps(payload, ensure_ascii=False), []
+
+    # Sort articles per feed by published time
+    for feed_data in feeds_by_url.values():
+        feed_data["articles"].sort(key=lambda a: a.get("published") or "")
+
+    # Prepare payload sorted by priority (descending)
+    sorted_feeds = sorted(
+        feeds_by_url.values(),
+        key=lambda f: f["priority"],
+        reverse=True,
+    )
+
     payload = {
-        "user": {
-            "username": username,
-        },
         "summary_goal": summary_goal,
-        "feeds": list(feed_context.values()),
-        "articles": normalized,
+        "feeds": [
+            {
+                "priority": f["priority"],
+                "description": f["description"],
+                "representation": f["representation"],
+                "articles": f["articles"],
+            }
+            for f in sorted_feeds
+        ],
     }
+
+    # Unique list of item IDs to mark as read
+    item_ids: list[str] = []
+    seen: set[str] = set()
+    for f in feeds_by_url.values():
+        for iid in f["item_ids"]:
+            if iid and iid not in seen:
+                seen.add(iid)
+                item_ids.append(iid)
+
     payload_json = json.dumps(payload, ensure_ascii=False)
     logging.info(
-        "Built summarization payload: %d feeds, %d articles, %d chars JSON",
-        len(feed_context),
-        len(normalized),
+        "Built summarization payload: %d feeds, %d items, %d chars JSON",
+        len(sorted_feeds),
+        len(item_ids),
         len(payload_json),
     )
-    return payload_json
+
+    return payload_json, item_ids
 
 
-def call_openai(model: str, payload_json: str, max_output_tokens: int) -> str:
+def call_openai(model: str, payload_json: str, max_output_tokens: int, model_instructions: str | None) -> str:
     client = OpenAI()
     logging.info("Calling OpenAI model %s via Responses API", model)
+
+    base_instructions = (
+        model_instructions.strip()
+        if model_instructions and model_instructions.strip()
+        else (
+            "You generate a single, elegantly written daily digest for the user.\n"
+            "You receive JSON containing:\n"
+            "- summary_goal: how the user wants the digest to feel and what to prioritize.\n"
+            "- feeds: an array where each feed has:\n"
+            "  - priority (higher = more important to the user)\n"
+            "  - description (what this feed usually covers)\n"
+            "  - representation (how the user wants this feed to show up in the digest)\n"
+            "  - articles: with title, main text content, and publication time.\n\n"
+            "Use the per-feed priority, description, and representation fields as strong signals of the user's intent."
+        )
+    )
+
+    structure_instructions = (
+        "\n\nWrite a single, unified summary organized by themes and importance, not by source.\n"
+        "- Do not create sections named after feeds.\n"
+        "- Focus on what is maximally relevant and high-signal for the user.\n"
+        "- Use clear headings and short paragraphs where helpful.\n"
+        "- Return only the inner HTML for a single <article> element (no <html> or <body>)."
+    )
+
+    instructions = base_instructions + structure_instructions
+
     response = client.responses.create(
         model=model,
-        instructions=textwrap.dedent(
-            """You write a single, elegantly written HTML article that synthesizes
-many RSS items for one user.
-The input is JSON with a summary_goal, feed metadata (titles, URLs,
-descriptions, categories) and an array of articles (titles, URLs,
-publication times, and main content text).
-
-Use feed titles, descriptions and categories as strong signals of what the
-user values.
-Prioritize what is maximally relevant to them and de-emphasize noise.
-Do not create sections per source; instead, weave a unified narrative
-organized by themes and importance.
-Use natural prose and link phrases with <a href="...">…</a>
-when specific stories are referenced.
-
-Return only the inner HTML of a single <article> element (no <html>
-or <body>)."""
-        ),
+        instructions=instructions,
         input=(
             "Here is the JSON input for today's unread items. "
             "Write the best possible article for this user.\n\n" + payload_json
@@ -321,19 +469,19 @@ def ensure_article_wrapper(inner_html: str) -> str:
 def format_output(article_html: str, output_format: str) -> str:
     output_format = (output_format or "article").lower()
     if output_format not in ("text", "html_page", "article"):
-        logging.warning(
-            "Unknown OUTPUT_FORMAT %r, defaulting to 'article'", output_format
-        )
+        logging.warning("Unknown OUTPUT_FORMAT %r, defaulting to 'article'", output_format)
         output_format = "article"
+
     if output_format == "article":
         return ensure_article_wrapper(article_html)
+
     if output_format == "html_page":
         article_block = ensure_article_wrapper(article_html)
         return (
             "<!DOCTYPE html>\n"
-            '<html lang="en">\n'
+            "<html lang=\"en\">\n"
             "<head>\n"
-            '<meta charset="utf-8">\n'
+            "<meta charset=\"utf-8\">\n"
             "<title>Daily Feed Synthesis</title>\n"
             "</head>\n"
             "<body>\n"
@@ -341,67 +489,129 @@ def format_output(article_html: str, output_format: str) -> str:
             "</body>\n"
             "</html>\n"
         )
+
+    # Plain text
     article_block = ensure_article_wrapper(article_html)
     text = strip_html(article_block)
     return text + "\n"
 
 
+def get_token_for_write(base_url: str, auth_token: str, timeout: int = 10) -> str | None:
+    url = base_url.rstrip("/") + "/reader/api/0/token"
+    headers = {"Authorization": "GoogleLogin auth=" + auth_token}
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+    except Exception as exc:
+        logging.warning("Failed to fetch write token: %s", exc)
+        return None
+    if resp.status_code != 200:
+        logging.warning("Token request failed with HTTP %s", resp.status_code)
+        return None
+    token = resp.text.strip()
+    if not token:
+        logging.warning("Empty token received from token endpoint")
+        return None
+    logging.info("Obtained write token")
+    return token
+
+
+def mark_items_read(base_url: str, auth_token: str, item_ids: list[str]):
+    if not item_ids:
+        logging.info("No items to mark as read")
+        return
+
+    token = get_token_for_write(base_url, auth_token)
+    if not token:
+        logging.warning("Cannot mark items read without token")
+        return
+
+    url = base_url.rstrip("/") + "/reader/api/0/edit-tag"
+    headers = {"Authorization": "GoogleLogin auth=" + auth_token}
+
+    data = [("T", token), ("a", "user/-/state/com.google/read")]
+    for iid in item_ids:
+        data.append(("i", iid))
+
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=20)
+    except Exception as exc:
+        logging.warning("Failed to mark items as read: %s", exc)
+        return
+
+    if resp.status_code != 200:
+        logging.warning("Mark-read request failed with HTTP %s", resp.status_code)
+        return
+
+    logging.info("Marked %d items as read in FreshRSS", len(item_ids))
+
+
 def main():
     setup_logging()
     logging.info("Starting FreshRSS greader summarizer run")
+
     base_url = env("FRESHRSS_API_URL", required=True)
     username = env("FRESHRSS_USERNAME", required=True)
     api_password = env("FRESHRSS_API_PASSWORD", required=True)
-    summary_goal = env(
-        "SUMMARY_PROMPT",
-        required=False,
-        default=(
-            "Write a single, elegantly written synthesis of these unread items, "
-            "tailored to what this user cares about."
-        ),
+    feed_config_path = env("FEED_CONFIG_PATH", required=False)
+
+    global_cfg, feeds_cfg = load_yaml_config(feed_config_path)
+    summary_goal = global_cfg.get(
+        "summary_goal",
+        "Write a single, elegantly written synthesis of these unread items, "
+        "tailored to what this user cares about.",
     )
+    model_instructions = global_cfg.get("model_instructions")
+
     openai_model = env("OPENAI_MODEL", required=False, default="gpt-4.1-mini")
     max_items = int(env("MAX_ITEMS", required=False, default="200"))
     max_output_tokens = int(env("MAX_OUTPUT_TOKENS", required=False, default="1200"))
     output_format = env("OUTPUT_FORMAT", required=False, default="article")
-    fetch_full_content = (
-        env("FETCH_FULL_CONTENT", required=False, default="true").lower() == "true"
-    )
+    fetch_full_content = env("FETCH_FULL_CONTENT", required=False, default="true").lower() == "true"
     article_max_chars = int(env("ARTICLE_MAX_CHARS", required=False, default="4000"))
+
     try:
         auth_token = authenticate_greader(base_url, username, api_password)
         subscriptions = fetch_subscriptions(base_url, auth_token)
         items = fetch_unread_items(base_url, auth_token, max_items)
+
         if not items:
             logging.info("No unread items; generating empty output")
             placeholder = (
                 "<article><h1>No new items</h1>"
-                "<p>You are fully caught up."
-                " There are no unread articles for this period.</p>"
+                "<p>You are fully caught up. There are no unread articles for this period.</p>"
                 "</article>"
             )
             sys.stdout.write(format_output(placeholder, output_format))
             return
-        stream_ids: set[str] = set()
-        for i in items:
-            origin = i.get("origin") or {}
-            sid = origin.get("streamId")
-            if sid:
-                stream_ids.add(sid)
-        feed_descriptions = fetch_feed_descriptions(base_url, auth_token, stream_ids)
-        payload_json = build_summarization_payload(
-            username,
-            summary_goal,
+
+        payload_json, item_ids = build_summarization_payload_and_item_ids(
             items,
             subscriptions,
-            feed_descriptions,
+            feeds_cfg,
+            summary_goal,
             fetch_full_content,
             article_max_chars,
         )
-        article_inner_html = call_openai(openai_model, payload_json, max_output_tokens)
+
+        if not item_ids:
+            logging.info("No items with usable content to summarize; skipping OpenAI call")
+            placeholder = (
+                "<article><h1>Nothing worth summarizing</h1>"
+                "<p>Unread items were present, but none had sufficiently useful content.</p>"
+                "</article>"
+            )
+            sys.stdout.write(format_output(placeholder, output_format))
+            return
+
+        article_inner_html = call_openai(openai_model, payload_json, max_output_tokens, model_instructions)
         final_output = format_output(article_inner_html, output_format)
         sys.stdout.write(final_output)
+
+        # Mark all considered items as read
+        mark_items_read(base_url, auth_token, item_ids)
+
         logging.info("Run completed successfully")
+
     except Exception as exc:
         logging.exception("Run failed: %s", exc)
         sys.exit(1)
