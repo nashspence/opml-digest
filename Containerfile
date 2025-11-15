@@ -7,6 +7,6 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir requests openai trafilatura
 
-COPY freshrss_digest.py /app/freshrss_digest.py
+COPY greader-digest.py /app/greader-digest.py
 
-CMD ["python", "/app/freshrss_digest.py"]
+CMD ["python", "/app/greader-digest.py"]
