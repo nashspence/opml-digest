@@ -37,3 +37,4 @@ repos:
           - types-requests
           - trafilatura
           - openai
+          - types-PyYAML
