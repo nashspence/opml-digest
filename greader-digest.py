@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-import os
-import sys
 import json
 import logging
+import os
+import sys
+import textwrap
 from datetime import datetime, timezone
+from typing import Any
 
 import requests
 import trafilatura
@@ -29,8 +31,8 @@ def env(name, default=None, required=False):
 
 
 def strip_html(html_text: str) -> str:
-    import re
     import html as html_mod
+    import re
 
     text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html_text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -39,7 +41,9 @@ def strip_html(html_text: str) -> str:
     return text.strip()
 
 
-def authenticate_greader(base_url: str, username: str, api_password: str, timeout: int = 20) -> str:
+def authenticate_greader(
+    base_url: str, username: str, api_password: str, timeout: int = 20
+) -> str:
     url = base_url.rstrip("/") + "/accounts/ClientLogin"
     logging.info("Authenticating to FreshRSS Google Reader API as %s", username)
     resp = requests.post(
@@ -62,9 +66,11 @@ def authenticate_greader(base_url: str, username: str, api_password: str, timeou
     return auth_token
 
 
-def fetch_subscriptions(base_url: str, auth_token: str, timeout: int = 20) -> dict:
+def fetch_subscriptions(
+    base_url: str, auth_token: str, timeout: int = 20
+) -> dict[str, dict[str, Any]]:
     url = base_url.rstrip("/") + "/reader/api/0/subscription/list"
-    params = {"output": "json"}
+    params: dict[str, str] = {"output": "json"}
     headers = {"Authorization": "GoogleLogin auth=" + auth_token}
     logging.info("Fetching subscriptions")
     resp = requests.get(url, headers=headers, params=params, timeout=timeout)
@@ -74,17 +80,21 @@ def fetch_subscriptions(base_url: str, auth_token: str, timeout: int = 20) -> di
     data = resp.json()
     subs = data.get("subscriptions", [])
     logging.info("Fetched %d subscriptions", len(subs))
-    sub_map = {}
+    sub_map: dict[str, dict[str, Any]] = {}
     for s in subs:
+        if not isinstance(s, dict):
+            continue
         sid = s.get("id")
-        if sid:
+        if isinstance(sid, str):
             sub_map[sid] = s
     return sub_map
 
 
-def fetch_unread_items(base_url: str, auth_token: str, max_items: int, timeout: int = 30) -> list:
+def fetch_unread_items(
+    base_url: str, auth_token: str, max_items: int, timeout: int = 30
+) -> list[dict[str, Any]]:
     url = base_url.rstrip("/") + "/reader/api/0/stream/contents/reading-list"
-    params = {
+    params: dict[str, str | int] = {
         "n": max_items,
         "xt": "user/-/state/com.google/read",
         "output": "json",
@@ -98,10 +108,12 @@ def fetch_unread_items(base_url: str, auth_token: str, max_items: int, timeout: 
     data = resp.json()
     items = data.get("items", [])
     logging.info("Fetched %d unread items", len(items))
-    return items
+    return [i for i in items if isinstance(i, dict)]
 
 
-def fetch_feed_descriptions(base_url: str, auth_token: str, stream_ids: set, timeout: int = 20) -> dict:
+def fetch_feed_descriptions(
+    base_url: str, auth_token: str, stream_ids: set[str], timeout: int = 20
+) -> dict[str, str]:
     headers = {"Authorization": "GoogleLogin auth=" + auth_token}
     feed_descriptions: dict[str, str] = {}
     if not stream_ids:
@@ -109,14 +121,16 @@ def fetch_feed_descriptions(base_url: str, auth_token: str, stream_ids: set, tim
     logging.info("Fetching feed descriptions for %d feeds", len(stream_ids))
     for sid in stream_ids:
         url = base_url.rstrip("/") + "/reader/api/0/stream/contents/" + sid
-        params = {"n": 0, "output": "json"}
+        params: dict[str, str | int] = {"n": 0, "output": "json"}
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=timeout)
         except Exception as exc:
             logging.warning("Error fetching description for %s: %s", sid, exc)
             continue
         if resp.status_code != 200:
-            logging.warning("Failed to fetch feed metadata for %s, HTTP %s", sid, resp.status_code)
+            logging.warning(
+                "Failed to fetch feed metadata for %s, HTTP %s", sid, resp.status_code
+            )
             continue
         try:
             data = resp.json()
@@ -172,9 +186,7 @@ def normalize_item(
         or ""
     )
     feed_description = (
-        feed_descriptions.get(stream_id)
-        or subscription.get("description")
-        or ""
+        feed_descriptions.get(stream_id) or subscription.get("description") or ""
     )
     summary_html = ""
     summary_obj = item.get("summary") or {}
@@ -227,7 +239,9 @@ def build_summarization_payload(
     article_max_chars: int,
 ) -> str:
     normalized = [
-        normalize_item(i, subscriptions, feed_descriptions, fetch_full_content, article_max_chars)
+        normalize_item(
+            i, subscriptions, feed_descriptions, fetch_full_content, article_max_chars
+        )
         for i in items
     ]
     normalized = [n for n in normalized if n["title"] or n["content"]]
@@ -268,17 +282,23 @@ def call_openai(model: str, payload_json: str, max_output_tokens: int) -> str:
     logging.info("Calling OpenAI model %s via Responses API", model)
     response = client.responses.create(
         model=model,
-        instructions=(
-            "You write a single, elegantly written HTML article that synthesizes many RSS items "
-            "for one user. The input is JSON with a summary_goal, feed metadata (titles, URLs, "
-            "descriptions, categories) and an array of articles (titles, URLs, publication times, "
-            "and main content text).\n\n"
-            "Use feed titles, descriptions and categories as strong signals of what the user values. "
-            "Prioritize what is maximally relevant to them and de-emphasize noise. Do not create "
-            "sections per source; instead, weave a unified narrative organized by themes and importance. "
-            "Use natural prose and link phrases with <a href=\"...\">…</a> when specific stories are "
-            "referenced.\n\n"
-            "Return only the inner HTML of a single <article> element (no <html> or <body>)."
+        instructions=textwrap.dedent(
+            """You write a single, elegantly written HTML article that synthesizes
+many RSS items for one user.
+The input is JSON with a summary_goal, feed metadata (titles, URLs,
+descriptions, categories) and an array of articles (titles, URLs,
+publication times, and main content text).
+
+Use feed titles, descriptions and categories as strong signals of what the
+user values.
+Prioritize what is maximally relevant to them and de-emphasize noise.
+Do not create sections per source; instead, weave a unified narrative
+organized by themes and importance.
+Use natural prose and link phrases with <a href="...">…</a>
+when specific stories are referenced.
+
+Return only the inner HTML of a single <article> element (no <html>
+or <body>)."""
         ),
         input=(
             "Here is the JSON input for today's unread items. "
@@ -301,7 +321,9 @@ def ensure_article_wrapper(inner_html: str) -> str:
 def format_output(article_html: str, output_format: str) -> str:
     output_format = (output_format or "article").lower()
     if output_format not in ("text", "html_page", "article"):
-        logging.warning("Unknown OUTPUT_FORMAT %r, defaulting to 'article'", output_format)
+        logging.warning(
+            "Unknown OUTPUT_FORMAT %r, defaulting to 'article'", output_format
+        )
         output_format = "article"
     if output_format == "article":
         return ensure_article_wrapper(article_html)
@@ -309,9 +331,9 @@ def format_output(article_html: str, output_format: str) -> str:
         article_block = ensure_article_wrapper(article_html)
         return (
             "<!DOCTYPE html>\n"
-            "<html lang=\"en\">\n"
+            '<html lang="en">\n'
             "<head>\n"
-            "<meta charset=\"utf-8\">\n"
+            '<meta charset="utf-8">\n'
             "<title>Daily Feed Synthesis</title>\n"
             "</head>\n"
             "<body>\n"
@@ -342,7 +364,9 @@ def main():
     max_items = int(env("MAX_ITEMS", required=False, default="200"))
     max_output_tokens = int(env("MAX_OUTPUT_TOKENS", required=False, default="1200"))
     output_format = env("OUTPUT_FORMAT", required=False, default="article")
-    fetch_full_content = env("FETCH_FULL_CONTENT", required=False, default="true").lower() == "true"
+    fetch_full_content = (
+        env("FETCH_FULL_CONTENT", required=False, default="true").lower() == "true"
+    )
     article_max_chars = int(env("ARTICLE_MAX_CHARS", required=False, default="4000"))
     try:
         auth_token = authenticate_greader(base_url, username, api_password)
@@ -352,7 +376,8 @@ def main():
             logging.info("No unread items; generating empty output")
             placeholder = (
                 "<article><h1>No new items</h1>"
-                "<p>You are fully caught up. There are no unread articles for this period.</p>"
+                "<p>You are fully caught up."
+                " There are no unread articles for this period.</p>"
                 "</article>"
             )
             sys.stdout.write(format_output(placeholder, output_format))
