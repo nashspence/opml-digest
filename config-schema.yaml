@@ -1,0 +1,54 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: opml-digest configuration
+type: object
+required:
+  - prompt
+  - openaiModel
+  - maxOutputTokens
+  - feeds
+properties:
+  prompt:
+    type: string
+    minLength: 1
+    description: "Instruction template describing how to format the summary."
+  openaiModel:
+    type: string
+    minLength: 1
+    description: "OpenAI model name passed to the Responses API."
+  maxOutputTokens:
+    type: integer
+    minimum: 1
+    description: "Upper bound for the number of tokens returned by the Responses API."
+  feeds:
+    type: array
+    minItems: 1
+    description: "Ordered list of feed configurations."
+    items:
+      type: object
+      required:
+        - url
+        - priority
+        - description
+        - representation
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          minLength: 1
+          description: "RSS/Atom feed URL to scrape."
+        title:
+          type: string
+          default: ""
+          description: "Human-friendly feed name shown to the model."
+        priority:
+          type: integer
+          description: "Higher numbers are sorted first before contacting OpenAI."
+        description:
+          type: string
+          minLength: 1
+          description: "Brief explanation of why the feed matters."
+        representation:
+          type: string
+          minLength: 1
+          description: "A short, consistent identifier for the feed."
+additionalProperties: false
