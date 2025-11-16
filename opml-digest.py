@@ -14,6 +14,7 @@ from dateutil import parser as dateparser
 from jsonschema import Draft202012Validator
 from openai import OpenAI
 
+
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -75,7 +76,9 @@ def load_example_config() -> str:
     except FileNotFoundError:
         logging.error("Example configuration file is missing: %s", example_path)
     except OSError as exc:
-        logging.error("Failed to read example configuration from %s: %s", example_path, exc)
+        logging.error(
+            "Failed to read example configuration from %s: %s", example_path, exc
+        )
     sys.exit(1)
 
 
@@ -117,6 +120,20 @@ def parse_config(config_path: str):
             "priority": int(feed["priority"]),
             "description": feed["description"],
             "representation": feed["representation"],
+            "includeComments": bool(feed["includeComments"]),
+            "maxPosts": (
+                int(feed["maxPosts"]) if feed["maxPosts"] is not None else None
+            ),
+            "maxArticleChars": (
+                int(feed["maxArticleChars"])
+                if feed["maxArticleChars"] is not None
+                else None
+            ),
+            "maxCommentsChars": (
+                int(feed["maxCommentsChars"])
+                if feed["maxCommentsChars"] is not None
+                else None
+            ),
         }
         for feed in config["feeds"]
     ]
@@ -152,7 +169,9 @@ def entry_datetime(entry) -> datetime | None:
     return dt
 
 
-def scrape_entry_content(url: str) -> tuple[str | None, str | None]:
+def scrape_entry_content(
+    url: str, include_comments: bool
+) -> tuple[str | None, str | None]:
     if not url:
         return None, None
 
@@ -178,21 +197,22 @@ def scrape_entry_content(url: str) -> tuple[str | None, str | None]:
         logging.debug("trafilatura extract failed for %s: %s", url, exc)
 
     comments_text = None
-    try:
-        doc = trafilatura.bare_extraction(
-            downloaded,
-            url=url,
-            include_comments=True,
-            include_formatting=False,
-            include_links=False,
-            favor_precision=True,
-        )
-        if doc:
-            comments_field = getattr(doc, "comments", None)
-            if comments_field:
-                comments_text = comments_field.strip() or None
-    except Exception as exc:
-        logging.debug("trafilatura bare_extraction failed for %s: %s", url, exc)
+    if include_comments:
+        try:
+            doc = trafilatura.bare_extraction(
+                downloaded,
+                url=url,
+                include_comments=True,
+                include_formatting=False,
+                include_links=False,
+                favor_precision=True,
+            )
+            if doc:
+                comments_field = getattr(doc, "comments", None)
+                if comments_field:
+                    comments_text = comments_field.strip() or None
+        except Exception as exc:
+            logging.debug("trafilatura bare_extraction failed for %s: %s", url, exc)
 
     if text:
         text = text.strip()
@@ -207,17 +227,23 @@ def fetch_feed_articles(feed_cfg: dict, since_dt: datetime):
     logging.info("Fetching feed %s (%s)", feed_cfg.get("title") or "", url)
     parsed = feedparser.parse(url)
     entries = parsed.entries or []
-    articles = []
+    articles: list[dict] = []
 
     for entry in entries:
+        if feed_cfg["maxPosts"] is not None and len(articles) >= feed_cfg["maxPosts"]:
+            break
+
         dt = entry_datetime(entry)
         if not dt or dt <= since_dt:
             continue
 
         link = getattr(entry, "link", "") or ""
-        content, comments = scrape_entry_content(link)
+        content, comments = scrape_entry_content(link, feed_cfg["includeComments"])
         if not content:
             continue
+
+        if feed_cfg["maxArticleChars"] is not None:
+            content = content[: feed_cfg["maxArticleChars"]]
 
         title = getattr(entry, "title", "") or ""
         published_iso = dt.isoformat()
@@ -230,7 +256,9 @@ def fetch_feed_articles(feed_cfg: dict, since_dt: datetime):
             }
         )
 
-        if comments:
+        if feed_cfg["includeComments"] and comments:
+            if feed_cfg["maxCommentsChars"] is not None:
+                comments = comments[: feed_cfg["maxCommentsChars"]]
             articles[-1]["comments"] = comments
 
     logging.info(
