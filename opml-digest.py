@@ -164,27 +164,54 @@ def entry_datetime(entry) -> datetime | None:
     return dt
 
 
-def scrape_entry_content(url: str) -> str | None:
+def scrape_entry_content(url: str) -> tuple[str | None, str | None]:
     if not url:
-        return None
+        return None, None
+
+    downloaded = None
+    try:
+        downloaded = trafilatura.fetch_url(url)
+    except Exception as exc:
+        logging.debug("trafilatura fetch_url failed for %s: %s", url, exc)
+
+    if not downloaded:
+        return None, None
+
     text = None
     try:
         text = trafilatura.extract(
-            None,
-            url=url,
+            downloaded,
             include_comments=False,
             include_formatting=False,
             include_links=False,
             favor_precision=True,
         )
     except Exception as exc:
-        logging.debug("trafilatura extract(url=...) failed for %s: %s", url, exc)
+        logging.debug("trafilatura extract failed for %s: %s", url, exc)
+
+    comments_text = None
+    try:
+        doc = trafilatura.bare_extraction(
+            downloaded,
+            url=url,
+            include_comments=True,
+            include_formatting=False,
+            include_links=False,
+            favor_precision=True,
+        )
+        if doc:
+            comments_field = getattr(doc, "comments", None)
+            if comments_field:
+                comments_text = comments_field.strip() or None
+    except Exception as exc:
+        logging.debug("trafilatura bare_extraction failed for %s: %s", url, exc)
 
     if text:
         text = text.strip()
-        if text:
-            return text
-    return None
+        if not text:
+            text = None
+
+    return text, comments_text
 
 
 def fetch_feed_articles(feed_cfg: dict, since_dt: datetime):
@@ -200,7 +227,7 @@ def fetch_feed_articles(feed_cfg: dict, since_dt: datetime):
             continue
 
         link = getattr(entry, "link", "") or ""
-        content = scrape_entry_content(link)
+        content, comments = scrape_entry_content(link)
         if not content:
             continue
 
@@ -214,6 +241,9 @@ def fetch_feed_articles(feed_cfg: dict, since_dt: datetime):
                 "content": content,
             }
         )
+
+        if comments:
+            articles[-1]["comments"] = comments
 
     logging.info(
         "Feed %s produced %d scraped articles after %s",
