@@ -5,8 +5,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir requests openai trafilatura
+RUN pip install --no-cache-dir feedparser trafilatura python-dateutil openai
 
-COPY greader-digest.py /app/greader-digest.py
+COPY opml_digest.py /app/opml_digest.py
 
-CMD ["python", "/app/greader-digest.py"]
+CMD ["python", "/app/opml_digest.py"]
+
