@@ -51,4 +51,29 @@ properties:
           type: string
           minLength: 1
           description: "A short, consistent identifier for the feed."
+        includeComments:
+          type: boolean
+          default: false
+          description: "Whether to include scraped comments for each article."
+        maxPosts:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+          default: null
+          description: "Maximum number of recent articles to include; null means unlimited."
+        maxArticleChars:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+          default: null
+          description: "Maximum characters of article content to include; null means unlimited."
+        maxCommentsChars:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+          default: null
+          description: "Maximum characters of comments to include; null means unlimited."
 additionalProperties: false

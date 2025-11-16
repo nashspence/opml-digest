@@ -8,8 +8,14 @@ feeds:
     priority: 10
     description: Breaking technology headlines and analysis
     representation: tech-news
+    includeComments: true
+    maxPosts: 5
+    maxArticleChars: 4000
+    maxCommentsChars: 1000
+
   - url: https://example.org/atom.xml
     title: Example Company Blog
     priority: 5
     description: Product announcements and release notes
     representation: example-company
+    maxPosts: 3
