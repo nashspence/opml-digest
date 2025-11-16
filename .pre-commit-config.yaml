@@ -38,3 +38,4 @@ repos:
           - trafilatura
           - openai
           - types-PyYAML
+          - types-python-dateutil

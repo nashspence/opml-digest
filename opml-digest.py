@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import sys
-import os
 import json
 import logging
+import os
+import sys
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 
@@ -59,17 +59,25 @@ def parse_opml(opml_path: str):
     tokens_elem = head.find("maxOutputTokens")
 
     if prompt_elem is None or not (prompt_elem.text and prompt_elem.text.strip()):
-        logging.error("OPML <head><prompt>...</prompt></head> is required and must be non-empty")
+        logging.error(
+            "OPML <head><prompt>...</prompt></head> is required and must be non-empty"
+        )
         sys.exit(1)
     prompt = prompt_elem.text.strip()
 
     if model_elem is None or not (model_elem.text and model_elem.text.strip()):
-        logging.error("OPML <head><openaiModel>...</openaiModel></head> is required and must be non-empty")
+        logging.error(
+            "OPML <head><openaiModel>...</openaiModel></head> is required and must "
+            "be non-empty"
+        )
         sys.exit(1)
     openai_model = model_elem.text.strip()
 
     if tokens_elem is None or not (tokens_elem.text and tokens_elem.text.strip()):
-        logging.error("OPML <head><maxOutputTokens>...</maxOutputTokens></head> is required and must be non-empty")
+        logging.error(
+            "OPML <head><maxOutputTokens>...</maxOutputTokens></head> is required "
+            "and must be non-empty"
+        )
         sys.exit(1)
     try:
         max_output_tokens = int(tokens_elem.text.strip())
@@ -92,17 +100,23 @@ def parse_opml(opml_path: str):
         try:
             priority = int(priority_str)
         except ValueError:
-            logging.error("Feed %s has non-integer 'priority': %s", xml_url, priority_str)
+            logging.error(
+                "Feed %s has non-integer 'priority': %s", xml_url, priority_str
+            )
             sys.exit(1)
 
         description = node.attrib.get("description")
         if description is None:
-            logging.error("Feed %s is missing required 'description' attribute", xml_url)
+            logging.error(
+                "Feed %s is missing required 'description' attribute", xml_url
+            )
             sys.exit(1)
 
         representation = node.attrib.get("representation")
         if representation is None:
-            logging.error("Feed %s is missing required 'representation' attribute", xml_url)
+            logging.error(
+                "Feed %s is missing required 'representation' attribute", xml_url
+            )
             sys.exit(1)
 
         feeds.append(
@@ -130,11 +144,21 @@ def parse_opml(opml_path: str):
 
 
 def entry_datetime(entry) -> datetime | None:
-    t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    t = getattr(entry, "published_parsed", None) or getattr(
+        entry, "updated_parsed", None
+    )
     if not t:
         return None
     try:
-        dt = datetime(t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, tzinfo=timezone.utc)
+        dt = datetime(
+            t.tm_year,
+            t.tm_mon,
+            t.tm_mday,
+            t.tm_hour,
+            t.tm_min,
+            t.tm_sec,
+            tzinfo=timezone.utc,
+        )
     except Exception:
         return None
     return dt
@@ -146,6 +170,7 @@ def scrape_entry_content(url: str) -> str | None:
     text = None
     try:
         text = trafilatura.extract(
+            None,
             url=url,
             include_comments=False,
             include_formatting=False,
@@ -216,7 +241,9 @@ def build_payload(prompt: str, feeds_cfg: list[dict], since_dt: datetime) -> dic
         )
 
     if not feeds_payload:
-        logging.info("No scraped articles after the given date; nothing to send to OpenAI")
+        logging.info(
+            "No scraped articles after the given date; nothing to send to OpenAI"
+        )
         return {}
 
     payload = {
@@ -235,13 +262,19 @@ def build_payload(prompt: str, feeds_cfg: list[dict], since_dt: datetime) -> dic
 def call_openai(model: str, payload: dict, max_output_tokens: int) -> str:
     client = OpenAI()
     payload_json = json.dumps(payload, ensure_ascii=False)
-    logging.info("Calling OpenAI model %s via Responses API (payload chars=%d)", model, len(payload_json))
+    logging.info(
+        "Calling OpenAI model %s via Responses API (payload chars=%d)",
+        model,
+        len(payload_json),
+    )
 
     instructions = (
         "You will receive a single JSON object.\n"
-        "- The 'prompt' field tells you exactly what to do and how the user wants the output formatted.\n"
+        "- The 'prompt' field tells you exactly what to do and how the user wants the "
+        "output formatted.\n"
         "- The 'feeds' array contains the content you should base your response on.\n"
-        "Follow the 'prompt' as closely as possible, using the provided feeds and articles as context."
+        "Follow the 'prompt' as closely as possible, using the provided feeds and "
+        "articles as context."
     )
 
     response = client.responses.create(

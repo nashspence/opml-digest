@@ -7,7 +7,6 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir feedparser trafilatura python-dateutil openai
 
-COPY opml_digest.py /app/opml_digest.py
+COPY opml-digest.py /app/opml-digest.py
 
-CMD ["python", "/app/opml_digest.py"]
-
+CMD ["python", "/app/opml-digest.py"]
