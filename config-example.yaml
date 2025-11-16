@@ -1,0 +1,15 @@
+prompt: |
+  Summarize the most important updates and format them as bullet points grouped by feed.
+openaiModel: gpt-4.1
+maxOutputTokens: 300
+feeds:
+  - url: https://example.com/rss.xml
+    title: Example Tech News
+    priority: 10
+    description: Breaking technology headlines and analysis
+    representation: tech-news
+  - url: https://example.org/atom.xml
+    title: Example Company Blog
+    priority: 5
+    description: Product announcements and release notes
+    representation: example-company

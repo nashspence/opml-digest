@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import logging
 import os
 import sys
 from datetime import datetime, timezone
-from xml.etree import ElementTree as ET
+from pathlib import Path
 
 import feedparser
 import trafilatura
+import yaml
 from dateutil import parser as dateparser
+from jsonschema import Draft202012Validator
 from openai import OpenAI
-
 
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -40,101 +42,87 @@ def parse_since_date(arg: str) -> datetime:
     return dt
 
 
-def parse_opml(opml_path: str):
+def apply_schema_defaults(instance, schema):
+    if isinstance(instance, dict) and isinstance(schema, dict):
+        for key, subschema in schema.get("properties", {}).items():
+            if key in instance:
+                instance[key] = apply_schema_defaults(instance[key], subschema)
+            elif "default" in subschema:
+                instance[key] = subschema["default"]
+    elif isinstance(instance, list) and isinstance(schema, dict):
+        item_schema = schema.get("items", {})
+        for idx, item in enumerate(instance):
+            instance[idx] = apply_schema_defaults(item, item_schema)
+    return instance
+
+
+def load_schema() -> dict:
+    schema_path = Path(__file__).with_name("config-schema.yaml")
     try:
-        tree = ET.parse(opml_path)
-    except Exception as exc:
-        logging.error("Failed to parse OPML file %s: %s", opml_path, exc)
-        sys.exit(1)
+        with schema_path.open("r", encoding="utf-8") as schema_file:
+            return yaml.safe_load(schema_file)
+    except FileNotFoundError:
+        logging.error("Configuration schema file is missing: %s", schema_path)
+    except yaml.YAMLError as exc:
+        logging.error("Failed to parse configuration schema: %s", exc)
+    sys.exit(1)
 
-    root = tree.getroot()
-    head = root.find("head")
-    if head is None:
-        logging.error("OPML must have a <head> element")
-        sys.exit(1)
 
-    # Required head fields: prompt, openaiModel, maxOutputTokens
-    prompt_elem = head.find("prompt")
-    model_elem = head.find("openaiModel")
-    tokens_elem = head.find("maxOutputTokens")
-
-    if prompt_elem is None or not (prompt_elem.text and prompt_elem.text.strip()):
-        logging.error(
-            "OPML <head><prompt>...</prompt></head> is required and must be non-empty"
-        )
-        sys.exit(1)
-    prompt = prompt_elem.text.strip()
-
-    if model_elem is None or not (model_elem.text and model_elem.text.strip()):
-        logging.error(
-            "OPML <head><openaiModel>...</openaiModel></head> is required and must "
-            "be non-empty"
-        )
-        sys.exit(1)
-    openai_model = model_elem.text.strip()
-
-    if tokens_elem is None or not (tokens_elem.text and tokens_elem.text.strip()):
-        logging.error(
-            "OPML <head><maxOutputTokens>...</maxOutputTokens></head> is required "
-            "and must be non-empty"
-        )
-        sys.exit(1)
+def load_example_config() -> str:
+    example_path = Path(__file__).with_name("config-example.yaml")
     try:
-        max_output_tokens = int(tokens_elem.text.strip())
-    except ValueError:
-        logging.error("maxOutputTokens must be an integer, got: %s", tokens_elem.text)
+        return example_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logging.error("Example configuration file is missing: %s", example_path)
+    except OSError as exc:
+        logging.error("Failed to read example configuration from %s: %s", example_path, exc)
+    sys.exit(1)
+
+
+def parse_config(config_path: str):
+    schema = load_schema()
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file)
+    except FileNotFoundError:
+        logging.error("YAML config file not found: %s", config_path)
+        sys.exit(1)
+    except yaml.YAMLError as exc:
+        logging.error("Failed to parse YAML config %s: %s", config_path, exc)
         sys.exit(1)
 
-    feeds = []
-    for node in root.findall(".//outline"):
-        xml_url = node.attrib.get("xmlUrl") or node.attrib.get("xmlURL")
-        if not xml_url:
-            continue
-
-        title = node.attrib.get("title") or node.attrib.get("text") or ""
-
-        priority_str = node.attrib.get("priority")
-        if priority_str is None:
-            logging.error("Feed %s is missing required 'priority' attribute", xml_url)
-            sys.exit(1)
-        try:
-            priority = int(priority_str)
-        except ValueError:
-            logging.error(
-                "Feed %s has non-integer 'priority': %s", xml_url, priority_str
-            )
-            sys.exit(1)
-
-        description = node.attrib.get("description")
-        if description is None:
-            logging.error(
-                "Feed %s is missing required 'description' attribute", xml_url
-            )
-            sys.exit(1)
-
-        representation = node.attrib.get("representation")
-        if representation is None:
-            logging.error(
-                "Feed %s is missing required 'representation' attribute", xml_url
-            )
-            sys.exit(1)
-
-        feeds.append(
-            {
-                "xml_url": xml_url,
-                "title": title,
-                "priority": priority,
-                "description": description,
-                "representation": representation,
-            }
-        )
-
-    if not feeds:
-        logging.error("No feeds with xmlUrl found in OPML")
+    if not isinstance(config, dict):
+        logging.error("Configuration root must be a mapping")
         sys.exit(1)
+
+    validator = Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(config), key=lambda e: e.path)
+    if errors:
+        for error in errors:
+            location = ".".join(str(segment) for segment in error.path) or "<root>"
+            logging.error("Config validation error at %s: %s", location, error.message)
+        sys.exit(1)
+
+    config = apply_schema_defaults(config, schema)
+
+    prompt = config["prompt"].strip()
+    openai_model = config["openaiModel"].strip()
+    max_output_tokens = int(config["maxOutputTokens"])
+
+    feeds = [
+        {
+            "url": feed["url"],
+            "title": feed.get("title", ""),
+            "priority": int(feed["priority"]),
+            "description": feed["description"],
+            "representation": feed["representation"],
+        }
+        for feed in config["feeds"]
+    ]
 
     logging.info(
-        "Loaded %d feeds from OPML; model=%s, max_output_tokens=%d",
+        "Loaded %d feeds from YAML; model=%s, max_output_tokens=%d",
         len(feeds),
         openai_model,
         max_output_tokens,
@@ -215,7 +203,7 @@ def scrape_entry_content(url: str) -> tuple[str | None, str | None]:
 
 
 def fetch_feed_articles(feed_cfg: dict, since_dt: datetime):
-    url = feed_cfg["xml_url"]
+    url = feed_cfg["url"]
     logging.info("Fetching feed %s (%s)", feed_cfg.get("title") or "", url)
     parsed = feedparser.parse(url)
     entries = parsed.entries or []
@@ -320,21 +308,47 @@ def call_openai(model: str, payload: dict, max_output_tokens: int) -> str:
 def main():
     setup_logging()
 
-    if len(sys.argv) != 3:
-        logging.error("Usage: %s /path/to/feeds.opml 2025-11-01", sys.argv[0])
+    parser = argparse.ArgumentParser(description="Summarise feeds using OpenAI.")
+    parser.add_argument("config", nargs="?", help="Path to YAML config")
+    parser.add_argument("since", nargs="?", help="ISO date/time from which to scrape")
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--write-example",
+        metavar="PATH",
+        help="Write an example YAML config to PATH and exit",
+    )
+    group.add_argument(
+        "--validate",
+        metavar="PATH",
+        help="Validate YAML config against the schema and exit",
+    )
+
+    args = parser.parse_args()
+
+    if args.write_example:
+        example_path = Path(args.write_example)
+        example_contents = load_example_config()
+        example_path.write_text(example_contents, encoding="utf-8")
+        logging.info("Wrote example config to %s", example_path)
+        sys.exit(0)
+
+    if args.validate:
+        parse_config(args.validate)
+        logging.info("Config at %s is valid", args.validate)
+        sys.exit(0)
+
+    if not (args.config and args.since):
+        parser.error("Usage: opml-digest.py /path/to/config.yaml 2025-11-01")
+
+    if not os.path.exists(args.config):
+        logging.error("YAML config file not found: %s", args.config)
         sys.exit(1)
 
-    opml_path = sys.argv[1]
-    since_arg = sys.argv[2]
-
-    if not os.path.exists(opml_path):
-        logging.error("OPML file not found: %s", opml_path)
-        sys.exit(1)
-
-    since_dt = parse_since_date(since_arg)
+    since_dt = parse_since_date(args.since)
     logging.info("Since date: %s", since_dt.isoformat())
 
-    prompt, openai_model, max_output_tokens, feeds_cfg = parse_opml(opml_path)
+    prompt, openai_model, max_output_tokens, feeds_cfg = parse_config(args.config)
     payload = build_payload(prompt, feeds_cfg, since_dt)
 
     if not payload:
