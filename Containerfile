@@ -7,8 +7,8 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir feedparser trafilatura python-dateutil openai pyyaml jsonschema
 
-COPY opml-digest.py /app/opml-digest.py
+COPY onefeed.py /app/onefeed.py
 COPY config-schema.yaml /app/config-schema.yaml
 COPY config-example.yaml /app/config-example.yaml
 
-CMD ["python", "/app/opml-digest.py"]
+CMD ["python", "/app/onefeed.py"]

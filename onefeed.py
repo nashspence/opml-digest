@@ -367,7 +367,7 @@ def main():
         sys.exit(0)
 
     if not (args.config and args.since):
-        parser.error("Usage: opml-digest.py /path/to/config.yaml 2025-11-01")
+        parser.error("Usage: onefeed.py /path/to/config.yaml 2025-11-01")
 
     if not os.path.exists(args.config):
         logging.error("YAML config file not found: %s", args.config)
